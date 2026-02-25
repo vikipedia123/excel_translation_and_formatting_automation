@@ -18,3 +18,18 @@ This tool processes `.xlsx` files and ensures:
 
 ```powershell
 & "C:\your-path-to-dotnet\dotnet.exe" build
+2️⃣ Set Your API Key
+$env:OPENAI_API_KEY="sk-proj-your-openai-api-key"
+3️⃣ Run the Translator
+& "C:\your-path-to-dotnet\dotnet.exe" run -- `
+"C:\Users\your-input-file.xlsx" `
+"C:\Users\your-output-file.xlsx"
+📁 Example
+& "C:\Program Files\dotnet\dotnet.exe" run -- `
+"C:\Users\Vicki.Burckel\Documents\Automation\B bold.xlsx" `
+"C:\Users\Vicki.Burckel\Documents\Automation\B bold_ZH.xlsx"
+📝 Notes
+
+ styling
+
+Writes translated content under the CHINESE column
