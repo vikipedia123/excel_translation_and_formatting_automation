@@ -7,6 +7,6 @@ Note: You can choose other AI API key
 `$env:OPENAI_API_KEY="sk-proj-yourbeautifulapiofopenai"`
 `$env:OPENAI_API_KEY="sk-proj-yourbeautifulapiofopenai"
 & "C:\yourpathofdotnet\dotnet\dotnet.exe" run -- `
-"C:\Users\yourfile.xlsx" `
+`"C:\Users\yourfile.xlsx"
 "C:\Users\yourtargetfilename.xlsx"`
 
