@@ -45,8 +45,8 @@ $env:OPENAI_API_KEY="sk-proj-your-openai-api-key"
 
 ``` powershell
 & "C:\Program Files\dotnet\dotnet.exe" run -- `
-"C:\Users\Vicki.Burckel\Documents\Automation\B bold.xlsx" `
-"C:\Users\Vicki.Burckel\Documents\Automation\B bold_ZH.xlsx"
+"C:\Users\your-input-file.xlsx" `
+"C:\Users\your-output-file.xlsx"
 ```
 
 ------------------------------------------------------------------------
@@ -54,9 +54,9 @@ $env:OPENAI_API_KEY="sk-proj-your-openai-api-key"
 ## 📝 Notes
 
 -   Your Excel file must contain headers:
-    -   `ENGLISH`
-    -   `CHINESE`
--   The program translates from **ENGLISH → CHINESE**
+    -   `YOUR Domain Language`
+    -   `YOUR Target language`
+-   The program from this file translates from **ENGLISH → CHINESE**
 -   Make sure Excel is closed before running
 -   The translated file will be saved to the specified output path
 
