@@ -1,0 +1,298 @@
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using ClosedXML.Excel;
+
+public record RunIn(int style_id, string text);
+public record RunOut(int style_id, string text);
+public record RunsPayload(List<RunIn> runs);
+public record RunsResult(List<RunOut> runs);
+
+internal class Program
+{
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    private const string HeaderEnglish = "ENGLISH";
+    private const string HeaderChinese = "CHINESE";
+
+    static async Task Main(string[] args)
+    {
+        // Usage:
+        //   dotnet run -- "C:\in.xlsx" "C:\out.xlsx"
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Usage: ExcelRichTranslate <in.xlsx> <out.xlsx>");
+            return;
+        }
+
+        var inPath = args[0];
+        var outPath = args[1];
+
+        var apiKey = CleanApiKey(Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new Exception("OPENAI_API_KEY is missing (or contains newlines). Set it in the same terminal session.");
+
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        using var wb = new XLWorkbook(inPath);
+
+        var tasks = new List<(IXLWorksheet ws, int row, int colEn, int colZh)>();
+
+        foreach (var ws in wb.Worksheets)
+        {
+            if (!TryFindColumns(ws, out int colEn, out int colZh))
+                continue;
+
+            var used = ws.RangeUsed();
+            if (used == null) continue;
+
+            int lastRow = used.RangeAddress.LastAddress.RowNumber;
+
+            for (int r = 2; r <= lastRow; r++)
+            {
+                var enCell = ws.Cell(r, colEn);
+
+                bool hasValue = !enCell.IsEmpty() && !string.IsNullOrWhiteSpace(enCell.GetString());
+                bool hasRich = enCell.HasRichText;
+
+                if (!hasValue && !hasRich) continue;
+
+                tasks.Add((ws, r, colEn, colZh));
+            }
+        }
+
+        if (tasks.Count == 0)
+        {
+            Console.WriteLine("No rows found to translate (check headers ENGLISH/CHINESE in row 1).");
+            return;
+        }
+
+        Console.WriteLine($"Found {tasks.Count} rows to translate.");
+
+        // caches
+        var cachePlain = new Dictionary<string, string>();
+        var cacheRuns = new Dictionary<string, List<string>>();
+
+        int done = 0;
+
+        foreach (var (ws, row, colEn, colZh) in tasks)
+        {
+            var enCell = ws.Cell(row, colEn);
+            var zhCell = ws.Cell(row, colZh);
+
+            try
+            {
+                if (enCell.HasRichText)
+                {
+                    // Read runs
+                    var runObjs = enCell.GetRichText().ToList();
+                    var runs = new List<RunIn>();
+                    for (int i = 0; i < runObjs.Count; i++)
+                        runs.Add(new RunIn(i + 1, runObjs[i].Text));
+
+                    var key = string.Join("|", runs.Select(r => $"{r.style_id}:{r.text}"));
+
+                    // Translate (same run count)
+                    if (!cacheRuns.TryGetValue(key, out var translatedRunTexts))
+                    {
+                        translatedRunTexts = await TranslateRunsGpt52(http, runs);
+                        cacheRuns[key] = translatedRunTexts;
+                    }
+
+                    ApplyRunsPreserveFormatting(enCell, zhCell, translatedRunTexts);
+                }
+                else
+                {
+                    var plain = enCell.GetString();
+
+                    if (!cachePlain.TryGetValue(plain, out var translated))
+                    {
+                        translated = await TranslatePlainGpt52(http, plain);
+                        cachePlain[plain] = translated;
+                    }
+
+                    // Copy cell style and write
+                    zhCell.Style = enCell.Style;
+                    zhCell.Value = translated;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] {ws.Name} row {row}: {ex.Message}");
+            }
+
+            done++;
+            if (done % 10 == 0 || done == tasks.Count)
+                Console.WriteLine($"Progress: {done}/{tasks.Count}");
+        }
+
+        wb.SaveAs(outPath);
+        Console.WriteLine($"Saved: {outPath}");
+    }
+
+    // ---------------------------
+    // Excel header detection
+    // ---------------------------
+    private static bool TryFindColumns(IXLWorksheet ws, out int colEn, out int colZh)
+    {
+        colEn = -1;
+        colZh = -1;
+
+        foreach (var cell in ws.Row(1).CellsUsed())
+        {
+            var v = (cell.GetString() ?? "").Trim();
+            if (v.Equals(HeaderEnglish, StringComparison.OrdinalIgnoreCase))
+                colEn = cell.Address.ColumnNumber;
+            if (v.Equals(HeaderChinese, StringComparison.OrdinalIgnoreCase))
+                colZh = cell.Address.ColumnNumber;
+        }
+
+        return colEn > 0 && colZh > 0;
+    }
+
+    // ---------------------------
+    // Apply runs preserving formatting
+    // ---------------------------
+    private static void ApplyRunsPreserveFormatting(IXLCell englishCell, IXLCell chineseCell, List<string> translatedRunTexts)
+    {
+        var original = englishCell.GetRichText().ToList();
+
+        if (original.Count != translatedRunTexts.Count)
+            throw new Exception($"Run count mismatch: original={original.Count} translated={translatedRunTexts.Count}");
+
+        // Copy cell-level formatting
+        chineseCell.Style = englishCell.Style;
+
+        // Clear and rebuild rich text (ClosedXML version-safe)
+        chineseCell.Clear(XLClearOptions.Contents);
+        var rt = chineseCell.CreateRichText();
+
+        for (int i = 0; i < original.Count; i++)
+        {
+            var origRun = original[i];
+            var newText = translatedRunTexts[i] ?? "";
+
+            var newRun = rt.AddText(newText);
+
+            newRun.Bold = origRun.Bold;
+            newRun.Italic = origRun.Italic;
+            newRun.Underline = origRun.Underline;
+            newRun.FontName = origRun.FontName;
+            newRun.FontSize = origRun.FontSize;
+            newRun.FontColor = origRun.FontColor;
+        }
+    }
+
+    // ---------------------------
+    // OpenAI calls (Responses API)
+    // ---------------------------
+    private static async Task<string> TranslatePlainGpt52(HttpClient http, string text)
+    {
+        var reqObj = new
+        {
+            model = "gpt-5.2",
+            input = new object[]
+            {
+                new {
+                    role = "user",
+                    content = new object[]
+                    {
+                        new { type = "input_text", text = "Translate from English to Simplified Chinese. Return only the translation." },
+                        new { type = "input_text", text }
+                    }
+                }
+            }
+        };
+
+        return (await CallResponsesApi(http, reqObj)).Trim();
+    }
+
+    private static async Task<List<string>> TranslateRunsGpt52(HttpClient http, List<RunIn> runs)
+    {
+        var payload = new RunsPayload(runs);
+
+        var reqObj = new
+        {
+            model = "gpt-5.2",
+            input = new object[]
+            {
+                new {
+                    role = "user",
+                    content = new object[]
+                    {
+                        new { type="input_text", text =
+@"You will receive JSON with an array of rich-text runs.
+Translate run.text from English to Simplified Chinese.
+Rules:
+- KEEP the SAME number of runs
+- KEEP the SAME style_id values
+- Return JSON ONLY:
+  { ""runs"": [ { ""style_id"": 1, ""text"": ""..."" }, ... ] }" },
+                        new { type="input_text", text = JsonSerializer.Serialize(payload) }
+                    }
+                }
+            }
+        };
+
+        var outText = await CallResponsesApi(http, reqObj);
+
+        RunsResult? parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<RunsResult>(outText, JsonOpts);
+        }
+        catch
+        {
+            throw new Exception("Model did not return valid JSON. Output:\n" + outText);
+        }
+
+        if (parsed?.runs == null || parsed.runs.Count == 0)
+            throw new Exception("Empty runs returned by model.");
+
+        var ordered = parsed.runs.OrderBy(r => r.style_id).ToList();
+        return ordered.Select(r => r.text ?? "").ToList();
+    }
+
+    private static async Task<string> CallResponsesApi(HttpClient http, object reqObj)
+    {
+        var json = JsonSerializer.Serialize(reqObj);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        using var resp = await http.PostAsync("https://api.openai.com/v1/responses", content);
+        var raw = await resp.Content.ReadAsStringAsync();
+
+        if (!resp.IsSuccessStatusCode)
+            throw new Exception($"OpenAI {(int)resp.StatusCode}: {raw}");
+
+        using var doc = JsonDocument.Parse(raw);
+
+        if (doc.RootElement.TryGetProperty("output_text", out var ot))
+        {
+            var s = ot.GetString();
+            if (!string.IsNullOrWhiteSpace(s)) return s!;
+        }
+
+        // fallback
+        try
+        {
+            var s = doc.RootElement.GetProperty("output")[0].GetProperty("content")[0].GetProperty("text").GetString();
+            if (!string.IsNullOrWhiteSpace(s)) return s!;
+        }
+        catch { }
+
+        throw new Exception("Could not extract text from response. Raw:\n" + raw);
+    }
+
+    private static string CleanApiKey(string? raw)
+    {
+        if (raw == null) return "";
+        var k = raw.Trim().Replace("\r", "").Replace("\n", "");
+        if (k.StartsWith(">>"))
+            k = k.TrimStart('>').Trim();
+        return k;
+    }
+}
