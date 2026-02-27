@@ -183,21 +183,18 @@ internal class Program
             }
         }
 
-        // Optional: enforce your expected layout (B-F) without hard-failing:
-        // CHINESE (B=2), ITALIAN (C=3), FRENCH (D=4), SPANISH (E=5), GERMAN (F=6)
-        // We'll just warn if headers are found in different columns.
+        // Optional: warn if not in expected columns (B-F)
         var expectedCols = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
         {
-            [HeaderChinese] = 2,
-            [HeaderItalian] = 3,
-            [HeaderFrench]  = 4,
-            [HeaderSpanish] = 5,
-            [HeaderGerman]  = 6,
+            [HeaderChinese] = 2, // B
+            [HeaderItalian] = 3, // C
+            [HeaderFrench]  = 4, // D
+            [HeaderSpanish] = 5, // E
+            [HeaderGerman]  = 6, // F
         };
 
         foreach (var (lang, col) in targets)
         {
-            // Reverse map language->header for warning
             var header = TargetHeaderToLanguage.First(kv => kv.Value.Equals(lang, StringComparison.OrdinalIgnoreCase)).Key;
             if (expectedCols.TryGetValue(header, out int exp) && col != exp)
             {
@@ -242,6 +239,33 @@ internal class Program
     }
 
     // ---------------------------
+    // Formal "you" helpers
+    // ---------------------------
+    private static string BuildPlainPrompt(string toLanguage)
+    {
+        var formalRule = GetFormalYouRule(toLanguage);
+
+        return
+$@"Translate from English to {toLanguage}.
+Tone: professional and polite.
+{formalRule}
+Return ONLY the translation. No quotes, no explanations.";
+    }
+
+    private static string GetFormalYouRule(string toLanguage)
+    {
+        return toLanguage switch
+        {
+            "French"  => @"Use the formal form ""vous"" (do NOT use ""tu"").",
+            "Italian" => @"Use the formal form ""Lei"" (capitalized) with appropriate 3rd-person verb forms (do NOT use ""tu"").",
+            "Spanish" => @"Use the formal form ""usted"" (or ""ustedes"" for plural) and corresponding 3rd-person verb forms (do NOT use ""tú""/""vosotros"").",
+            "German"  => @"Use the formal form ""Sie"" (capitalized) and corresponding verb forms (do NOT use ""du""/""ihr"").",
+            "Simplified Chinese" => @"Use polite/formal Chinese. Prefer ""您"" when addressing the reader directly and use courteous wording such as ""请/感谢"".",
+            _ => @"Use the most formal/polite address appropriate for the target language."
+        };
+    }
+
+    // ---------------------------
     // OpenAI calls (Responses API)
     // ---------------------------
     private static async Task<string> TranslatePlainGpt52(HttpClient http, string text, string toLanguage)
@@ -255,7 +279,7 @@ internal class Program
                     role = "user",
                     content = new object[]
                     {
-                        new { type = "input_text", text = $"Translate from English to {toLanguage}. Return only the translation." },
+                        new { type = "input_text", text = BuildPlainPrompt(toLanguage) },
                         new { type = "input_text", text }
                     }
                 }
@@ -281,9 +305,13 @@ internal class Program
                         new { type="input_text", text =
 $@"You will receive JSON with an array of rich-text runs.
 Translate run.text from English to {toLanguage}.
+Tone: professional and polite.
+{GetFormalYouRule(toLanguage)}
+
 Rules:
 - KEEP the SAME number of runs
 - KEEP the SAME style_id values
+- Do NOT add extra commentary
 - Return JSON ONLY:
   {{ ""runs"": [ {{ ""style_id"": 1, ""text"": ""..."" }}, ... ] }}" },
                         new { type="input_text", text = JsonSerializer.Serialize(payload) }
