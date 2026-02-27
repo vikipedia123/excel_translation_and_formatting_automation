@@ -1,0 +1,353 @@
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using ClosedXML.Excel;
+
+public record RunIn(int style_id, string text);
+public record RunOut(int style_id, string text);
+public record RunsPayload(List<RunIn> runs);
+public record RunsResult(List<RunOut> runs);
+
+internal class Program
+{
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    private const string HeaderEnglish = "ENGLISH";
+    private const string HeaderChinese = "CHINESE";
+    private const string HeaderItalian = "ITALIAN";
+    private const string HeaderFrench  = "FRENCH";
+    private const string HeaderSpanish = "SPANISH";
+    private const string HeaderGerman  = "GERMAN";
+
+    // Header -> prompt language
+    private static readonly Dictionary<string, string> TargetHeaderToLanguage = new(StringComparer.OrdinalIgnoreCase)
+    {
+        [HeaderChinese] = "Simplified Chinese",
+        [HeaderItalian] = "Italian",
+        [HeaderFrench]  = "French",
+        [HeaderSpanish] = "Spanish",
+        [HeaderGerman]  = "German",
+    };
+
+    static async Task Main(string[] args)
+    {
+        // Usage:
+        //   dotnet run -- "C:\in.xlsx" "C:\out.xlsx"
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Usage: ExcelRichTranslate <in.xlsx> <out.xlsx>");
+            return;
+        }
+
+        var inPath = args[0];
+        var outPath = args[1];
+
+        var apiKey = CleanApiKey(Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new Exception("OPENAI_API_KEY is missing (or contains newlines). Set it in the same terminal session.");
+
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        using var wb = new XLWorkbook(inPath);
+
+        // Tasks: worksheet + row + EN col + target columns (lang + col)
+        var tasks = new List<(IXLWorksheet ws, int row, int colEn, List<(string lang, int col)> targets)>();
+
+        foreach (var ws in wb.Worksheets)
+        {
+            if (!TryFindColumns(ws, out int colEn, out var targets))
+                continue;
+
+            var used = ws.RangeUsed();
+            if (used == null) continue;
+
+            int lastRow = used.RangeAddress.LastAddress.RowNumber;
+
+            for (int r = 2; r <= lastRow; r++)
+            {
+                var enCell = ws.Cell(r, colEn);
+
+                bool hasValue = !enCell.IsEmpty() && !string.IsNullOrWhiteSpace(enCell.GetString());
+                bool hasRich = enCell.HasRichText;
+
+                if (!hasValue && !hasRich) continue;
+
+                tasks.Add((ws, r, colEn, targets));
+            }
+        }
+
+        if (tasks.Count == 0)
+        {
+            Console.WriteLine("No rows found to translate (check headers in row 1: ENGLISH + CHINESE/ITALIAN/FRENCH/SPANISH/GERMAN).");
+            return;
+        }
+
+        Console.WriteLine($"Found {tasks.Count} rows to translate.");
+
+        // Caches (include language in the key)
+        var cachePlain = new Dictionary<string, string>(StringComparer.Ordinal);
+        var cacheRuns = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+
+        int done = 0;
+
+        foreach (var (ws, row, colEn, targets) in tasks)
+        {
+            var enCell = ws.Cell(row, colEn);
+
+            try
+            {
+                foreach (var (lang, targetCol) in targets)
+                {
+                    var targetCell = ws.Cell(row, targetCol);
+
+                    if (enCell.HasRichText)
+                    {
+                        // Read runs
+                        var runObjs = enCell.GetRichText().ToList();
+                        var runs = new List<RunIn>(runObjs.Count);
+                        for (int i = 0; i < runObjs.Count; i++)
+                            runs.Add(new RunIn(i + 1, runObjs[i].Text));
+
+                        var baseKey = string.Join("|", runs.Select(r => $"{r.style_id}:{r.text}"));
+                        var key = $"{lang}||{baseKey}";
+
+                        // Translate (same run count)
+                        if (!cacheRuns.TryGetValue(key, out var translatedRunTexts))
+                        {
+                            translatedRunTexts = await TranslateRunsGpt52(http, runs, lang);
+                            cacheRuns[key] = translatedRunTexts;
+                        }
+
+                        ApplyRunsPreserveFormatting(enCell, targetCell, translatedRunTexts);
+                    }
+                    else
+                    {
+                        var plain = enCell.GetString();
+                        var key = $"{lang}||{plain}";
+
+                        if (!cachePlain.TryGetValue(key, out var translated))
+                        {
+                            translated = await TranslatePlainGpt52(http, plain, lang);
+                            cachePlain[key] = translated;
+                        }
+
+                        // Copy cell style and write
+                        targetCell.Style = enCell.Style;
+                        targetCell.Value = translated;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] {ws.Name} row {row}: {ex.Message}");
+            }
+
+            done++;
+            if (done % 10 == 0 || done == tasks.Count)
+                Console.WriteLine($"Progress: {done}/{tasks.Count}");
+        }
+
+        wb.SaveAs(outPath);
+        Console.WriteLine($"Saved: {outPath}");
+    }
+
+    // ---------------------------
+    // Excel header detection
+    // ---------------------------
+    private static bool TryFindColumns(
+        IXLWorksheet ws,
+        out int colEn,
+        out List<(string lang, int col)> targets
+    )
+    {
+        colEn = -1;
+        targets = new List<(string lang, int col)>();
+
+        foreach (var cell in ws.Row(1).CellsUsed())
+        {
+            var header = (cell.GetString() ?? "").Trim();
+
+            if (header.Equals(HeaderEnglish, StringComparison.OrdinalIgnoreCase))
+            {
+                colEn = cell.Address.ColumnNumber;
+                continue;
+            }
+
+            if (TargetHeaderToLanguage.TryGetValue(header, out var lang))
+            {
+                targets.Add((lang, cell.Address.ColumnNumber));
+            }
+        }
+
+        // Optional: enforce your expected layout (B-F) without hard-failing:
+        // CHINESE (B=2), ITALIAN (C=3), FRENCH (D=4), SPANISH (E=5), GERMAN (F=6)
+        // We'll just warn if headers are found in different columns.
+        var expectedCols = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            [HeaderChinese] = 2,
+            [HeaderItalian] = 3,
+            [HeaderFrench]  = 4,
+            [HeaderSpanish] = 5,
+            [HeaderGerman]  = 6,
+        };
+
+        foreach (var (lang, col) in targets)
+        {
+            // Reverse map language->header for warning
+            var header = TargetHeaderToLanguage.First(kv => kv.Value.Equals(lang, StringComparison.OrdinalIgnoreCase)).Key;
+            if (expectedCols.TryGetValue(header, out int exp) && col != exp)
+            {
+                Console.WriteLine($"[WARN] Sheet '{ws.Name}': header '{header}' found in column {col} (expected {exp}). Will still translate.");
+            }
+        }
+
+        return colEn > 0 && targets.Count > 0;
+    }
+
+    // ---------------------------
+    // Apply runs preserving formatting
+    // ---------------------------
+    private static void ApplyRunsPreserveFormatting(IXLCell englishCell, IXLCell targetCell, List<string> translatedRunTexts)
+    {
+        var original = englishCell.GetRichText().ToList();
+
+        if (original.Count != translatedRunTexts.Count)
+            throw new Exception($"Run count mismatch: original={original.Count} translated={translatedRunTexts.Count}");
+
+        // Copy cell-level formatting
+        targetCell.Style = englishCell.Style;
+
+        // Clear and rebuild rich text
+        targetCell.Clear(XLClearOptions.Contents);
+        var rt = targetCell.CreateRichText();
+
+        for (int i = 0; i < original.Count; i++)
+        {
+            var origRun = original[i];
+            var newText = translatedRunTexts[i] ?? "";
+
+            var newRun = rt.AddText(newText);
+
+            newRun.Bold = origRun.Bold;
+            newRun.Italic = origRun.Italic;
+            newRun.Underline = origRun.Underline;
+            newRun.FontName = origRun.FontName;
+            newRun.FontSize = origRun.FontSize;
+            newRun.FontColor = origRun.FontColor;
+        }
+    }
+
+    // ---------------------------
+    // OpenAI calls (Responses API)
+    // ---------------------------
+    private static async Task<string> TranslatePlainGpt52(HttpClient http, string text, string toLanguage)
+    {
+        var reqObj = new
+        {
+            model = "gpt-5.2",
+            input = new object[]
+            {
+                new {
+                    role = "user",
+                    content = new object[]
+                    {
+                        new { type = "input_text", text = $"Translate from English to {toLanguage}. Return only the translation." },
+                        new { type = "input_text", text }
+                    }
+                }
+            }
+        };
+
+        return (await CallResponsesApi(http, reqObj)).Trim();
+    }
+
+    private static async Task<List<string>> TranslateRunsGpt52(HttpClient http, List<RunIn> runs, string toLanguage)
+    {
+        var payload = new RunsPayload(runs);
+
+        var reqObj = new
+        {
+            model = "gpt-5.2",
+            input = new object[]
+            {
+                new {
+                    role = "user",
+                    content = new object[]
+                    {
+                        new { type="input_text", text =
+$@"You will receive JSON with an array of rich-text runs.
+Translate run.text from English to {toLanguage}.
+Rules:
+- KEEP the SAME number of runs
+- KEEP the SAME style_id values
+- Return JSON ONLY:
+  {{ ""runs"": [ {{ ""style_id"": 1, ""text"": ""..."" }}, ... ] }}" },
+                        new { type="input_text", text = JsonSerializer.Serialize(payload) }
+                    }
+                }
+            }
+        };
+
+        var outText = await CallResponsesApi(http, reqObj);
+
+        RunsResult? parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<RunsResult>(outText, JsonOpts);
+        }
+        catch
+        {
+            throw new Exception("Model did not return valid JSON. Output:\n" + outText);
+        }
+
+        if (parsed?.runs == null || parsed.runs.Count == 0)
+            throw new Exception("Empty runs returned by model.");
+
+        // Align by style_id
+        var ordered = parsed.runs.OrderBy(r => r.style_id).ToList();
+        return ordered.Select(r => r.text ?? "").ToList();
+    }
+
+    private static async Task<string> CallResponsesApi(HttpClient http, object reqObj)
+    {
+        var json = JsonSerializer.Serialize(reqObj);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        using var resp = await http.PostAsync("https://api.openai.com/v1/responses", content);
+        var raw = await resp.Content.ReadAsStringAsync();
+
+        if (!resp.IsSuccessStatusCode)
+            throw new Exception($"OpenAI {(int)resp.StatusCode}: {raw}");
+
+        using var doc = JsonDocument.Parse(raw);
+
+        if (doc.RootElement.TryGetProperty("output_text", out var ot))
+        {
+            var s = ot.GetString();
+            if (!string.IsNullOrWhiteSpace(s)) return s!;
+        }
+
+        // fallback
+        try
+        {
+            var s = doc.RootElement.GetProperty("output")[0].GetProperty("content")[0].GetProperty("text").GetString();
+            if (!string.IsNullOrWhiteSpace(s)) return s!;
+        }
+        catch { }
+
+        throw new Exception("Could not extract text from response. Raw:\n" + raw);
+    }
+
+    private static string CleanApiKey(string? raw)
+    {
+        if (raw == null) return "";
+        var k = raw.Trim().Replace("\r", "").Replace("\n", "");
+        if (k.StartsWith(">>"))
+            k = k.TrimStart('>').Trim();
+        return k;
+    }
+}
